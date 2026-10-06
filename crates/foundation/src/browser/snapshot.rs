@@ -36,7 +36,7 @@
 //! [`SnapshotDom::unknown_style_props`], so a parity run can prove the
 //! property list complete.
 
-use super::dom::{Dom, ElId, KeyframeFrame, Rect, SelectorError};
+use super::dom::{renders_no_text, Dom, DomChild, ElId, KeyframeFrame, Rect, SelectorError};
 
 use super::selector::Selector;
 
@@ -61,6 +61,7 @@ pub const STYLE_PROPS: &[&str] = &[
     "animationIterationCount",
     "animationName",
     "animationTimingFunction",
+    "aspectRatio",
     "backdropFilter",
     "background",
     "backgroundClip",
@@ -88,9 +89,12 @@ pub const STYLE_PROPS: &[&str] = &[
     "clip-path",
     "clipPath",
     "color",
+    "colorScheme",
+    "contain",
     "content",
     "contentVisibility",
     "cssFloat",
+    "direction",
     "display",
     "filter",
     "float",
@@ -137,9 +141,12 @@ pub const STYLE_PROPS: &[&str] = &[
     "paddingLeft",
     "paddingRight",
     "paddingTop",
+    "perspective",
     "pointerEvents",
     "position",
     "right",
+    "rotate",
+    "scale",
     "textAlign",
     "textDecoration",
     "textDecorationLine",
@@ -152,6 +159,8 @@ pub const STYLE_PROPS: &[&str] = &[
     "transitionDuration",
     "transitionProperty",
     "transitionTimingFunction",
+    "translate",
+    "unicodeBidi",
     "verticalAlign",
     "visibility",
     "webkitBackgroundClip",
@@ -160,6 +169,7 @@ pub const STYLE_PROPS: &[&str] = &[
     "webkitTextFillColor",
     "whiteSpace",
     "width",
+    "willChange",
     "wordBreak",
     "zIndex",
 ];
@@ -263,8 +273,9 @@ pub struct SnapNode {
     #[serde(rename = "r", default)]
     pub rect: Option<[f64; 4]>,
     /// `[clientWidth, clientHeight, clientLeft, scrollWidth, scrollLeft,
-    /// offsetWidth, offsetHeight]` (`null` → NaN, as `undefined` crosses
-    /// into a wasm f64).
+    /// offsetWidth, offsetHeight, scrollHeight]` (`null` → NaN, as
+    /// `undefined` crosses into a wasm f64). Captures older than
+    /// `scrollHeight` carry seven columns, and it reads as NaN.
     #[serde(rename = "m", default)]
     pub metrics: Vec<Option<f64>>,
     /// `checkVisibility`: 1 / 0, `-1` when the method is missing.
@@ -737,6 +748,9 @@ impl Dom for SnapshotDom {
     fn next_element_sibling(&self, el: ElId) -> Option<ElId> {
         self.snap.next_element_sibling(el)
     }
+    fn first_element_child(&self, el: ElId) -> Option<ElId> {
+        self.snap.node(el).children.first().copied()
+    }
     fn contains(&self, a: ElId, b: ElId) -> bool {
         if !self.valid(a) || !self.valid(b) {
             return false;
@@ -822,6 +836,20 @@ impl Dom for SnapshotDom {
             .filter_map(|n| match n {
                 ChildNode::Text(t) => Some(t.clone()),
                 _ => None,
+            })
+            .collect()
+    }
+    /// A `CData` entry is not a `nodeType === 3` node, so it is left out
+    /// here as it is from [`Dom::direct_text_nodes`].
+    fn child_nodes(&self, el: ElId) -> Vec<DomChild> {
+        self.snap
+            .node(el)
+            .child_nodes
+            .iter()
+            .filter_map(|n| match n {
+                ChildNode::Text(t) => Some(DomChild::Text(t.clone())),
+                ChildNode::El(c) => Some(DomChild::Element(*c)),
+                ChildNode::CData(_) => None,
             })
             .collect()
     }
@@ -911,6 +939,9 @@ impl Dom for SnapshotDom {
     fn scroll_left(&self, el: ElId) -> f64 {
         metric(&self.snap.node(el).metrics, 4)
     }
+    fn scroll_height(&self, el: ElId) -> f64 {
+        metric(&self.snap.node(el).metrics, 7)
+    }
     fn offset_width(&self, el: ElId) -> f64 {
         metric(&self.snap.node(el).metrics, 5)
     }
@@ -939,15 +970,20 @@ impl Dom for SnapshotDom {
         if !self.snap.text_lines {
             return None;
         }
-        fn walk(snap: &Snapshot, el: ElId, out: &mut Vec<Rect>) {
-            let node = snap.node(el);
+        // A descendant that renders no text is skipped with its subtree, as
+        // the character count skips it (`renders_no_text`), so the lines and
+        // the characters divided among them describe the same text.
+        fn walk(dom: &SnapshotDom, el: ElId, out: &mut Vec<Rect>) {
+            let node = dom.snap.node(el);
             out.extend(node.text_rects.iter().map(rect4));
             for child in &node.children {
-                walk(snap, *child, out);
+                if !renders_no_text(dom, *child) {
+                    walk(dom, *child, out);
+                }
             }
         }
         let mut rects = Vec::new();
-        walk(&self.snap, el, &mut rects);
+        walk(self, el, &mut rects);
         Some(super::dom::merge_text_rects_into_lines(rects))
     }
 }
@@ -1069,6 +1105,88 @@ mod tests {
         assert_eq!(d.pseudo_style(2, "::placeholder", "color"), None);
     }
 
+    /// A capture that records the full current `STYLE_PROPS` answers
+    /// `direction`, `unicodeBidi` and `aspectRatio` through `Dom::style`.
+    #[test]
+    fn bidi_and_aspect_ratio_round_trip() {
+        let props: Vec<&str> = STYLE_PROPS.to_vec();
+        for want in ["direction", "unicodeBidi", "aspectRatio"] {
+            assert!(props.contains(&want), "{want} missing from STYLE_PROPS");
+        }
+        // One interned value per column, so each element's `s` row is the
+        // column order itself and a read must land on its own property name.
+        let strings: Vec<String> = props.iter().map(|p| format!("v:{p}")).collect();
+        let cols: Vec<usize> = (0..props.len()).collect();
+        let json = serde_json::json!({
+            "v": 1,
+            "hostname": "example.test",
+            "innerWidth": 1280,
+            "innerHeight": 800,
+            "styleProps": props,
+            "pseudoProps": ["content"],
+            "strings": strings,
+            "documentElement": 1,
+            "body": 2,
+            "els": [
+                {"t": "HTML", "c": [2], "s": cols},
+                {"t": "BODY", "p": 1, "c": [], "s": cols},
+            ],
+        })
+        .to_string();
+        let d = snap(&json);
+        assert_eq!(d.style(2, "direction"), "v:direction");
+        assert_eq!(d.style(2, "unicodeBidi"), "v:unicodeBidi");
+        assert_eq!(d.style(2, "aspectRatio"), "v:aspectRatio");
+        // Every other column still lands on its own name.
+        assert_eq!(d.style(2, "display"), "v:display");
+        assert_eq!(d.style(2, "zIndex"), "v:zIndex");
+        assert!(d.unknown_style_props().is_empty());
+    }
+
+    /// A capture recorded before the three properties were added still parses
+    /// and reads them as unknown rather than panicking or shifting columns.
+    #[test]
+    fn older_capture_without_the_new_props_still_loads() {
+        let d = snap(SMALL);
+        assert_eq!(d.style(5, "display"), "inline");
+        assert_eq!(d.style(5, "direction"), "");
+        assert_eq!(d.style(5, "unicodeBidi"), "");
+        assert_eq!(d.style(5, "aspectRatio"), "");
+        assert_eq!(
+            d.unknown_style_props(),
+            vec![
+                "direction".to_string(),
+                "unicodeBidi".to_string(),
+                "aspectRatio".to_string()
+            ]
+        );
+    }
+
+    /// The containing-block properties and `scrollHeight` joined the capture
+    /// later: a recording without them reads the properties as empty and the
+    /// metric as NaN, which the paint gate takes as undecided.
+    #[test]
+    fn older_capture_without_containing_block_props_or_scroll_height() {
+        let d = snap(SMALL);
+        for prop in ["willChange", "contain", "translate", "scale", "rotate", "perspective"] {
+            assert_eq!(d.style(4, prop), "", "{prop}");
+            assert!(STYLE_PROPS.contains(&prop), "{prop} missing from STYLE_PROPS");
+        }
+        assert!(d.scroll_height(4).is_nan());
+        let json = r#"{
+          "v": 1, "hostname": "example.test", "innerWidth": 1280, "innerHeight": 800,
+          "styleProps": ["display"], "pseudoProps": ["content"], "strings": ["block"],
+          "documentElement": 1, "body": 2,
+          "els": [
+            {"t":"HTML","c":[2],"s":[0],"m":[1280,800,0,1280,0,1280,800,800]},
+            {"t":"BODY","p":1,"c":[],"s":[0],"m":[1280,2400,0,1280,0,1280,2400]}
+          ]
+        }"#;
+        let d = snap(json);
+        assert_eq!(d.scroll_height(1), 800.0);
+        assert!(d.scroll_height(2).is_nan());
+    }
+
     #[test]
     fn selectors_over_snapshot() {
         let d = snap(SMALL);
@@ -1164,6 +1282,33 @@ mod tests {
         // An element the capture found no rendered text under is not
         // "unknown" — it is an element with no lines.
         assert_eq!(snap(NEW).text_line_rects(1).map(|l| l.len()), Some(2));
+    }
+
+    /// The line walk skips the subtrees the character count skips: a
+    /// `content-visibility: hidden` box, a `display: none` box and a
+    /// `<script>`, whatever rects the capture holds for them. The inline `<b>`
+    /// also says `content-visibility: hidden`, which an inline box ignores,
+    /// so its rects are kept.
+    #[test]
+    fn text_line_rects_skip_subtrees_that_render_no_text() {
+        const PAGE: &str = r#"{
+          "v": 1, "textLines": true, "documentElement": 1, "body": 2,
+          "styleProps": ["display", "contentVisibility"],
+          "strings": ["block", "visible", "inline-block", "hidden", "none", "inline"],
+          "els": [
+            {"t":"HTML","c":[2],"s":[0,1]},
+            {"t":"BODY","p":1,"c":[3],"s":[0,1]},
+            {"t":"P","p":2,"c":["seen ",4,5,6,7],"s":[0,1],
+             "dl":[[0,100,300,19]]},
+            {"t":"SPAN","p":3,"c":["skipped"],"s":[2,3],"dl":[[0,124,900,19]]},
+            {"t":"SPAN","p":3,"c":["gone"],"s":[4,1],"dl":[[0,148,900,19]]},
+            {"t":"SCRIPT","p":3,"c":["x"],"s":[0,1],"dl":[[0,172,900,19]]},
+            {"t":"B","p":3,"c":["kept"],"s":[5,3],"dl":[[300,100,60,19]]}
+          ]
+        }"#;
+        let lines = snap(PAGE).text_line_rects(3).expect("lines");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!((lines[0].left, lines[0].width), (0.0, 360.0));
     }
 
     #[test]

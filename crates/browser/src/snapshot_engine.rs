@@ -27,7 +27,7 @@
 
 use impeccable_core::browser::snapshot::{Facts, SnapshotDom};
 use impeccable_core::browser::visual::{self, CssPlan, Prepared, StackNode};
-use impeccable_core::browser::{BrowserConfig, Dom, ElId};
+use impeccable_core::browser::{BrowserConfig, ElId};
 use impeccable_core::color::Rgba;
 use serde_json::{json, Value};
 
@@ -55,15 +55,29 @@ pub fn ensure_snapshot_js(page: &mut Page<'_>) -> CdpResult<()> {
 /// stable across scrolls (the DOM is unchanged), which is why an earlier
 /// snapshot's ids keep matching the page's current `__impCap`.
 pub fn capture_snapshot(page: &mut Page<'_>) -> CdpResult<SnapshotDom> {
-    let expr = "(function(){ const s = window.__impeccableSnapshot; const c = s.capture(); if (c.error) return { error: c.error }; window.__impCap = c; window.__impIO = s.visualIO(c); return { json: c.json }; })()";
+    parse_snapshot(&capture_snapshot_json(page)?)
+}
+
+/// [`capture_snapshot`] without the parse: the capture's JSON exactly as the
+/// page produced it, which is what a replay loads.
+pub fn capture_snapshot_json(page: &mut Page<'_>) -> CdpResult<String> {
+    // The page-side default cap (48 MiB) exists for the extension's message
+    // channel. Over CDP the websocket accepts 256 MiB (`cdp.rs`), so a URL scan
+    // allows a capture up to 200 MiB: large commerce pages serialize to 70+ MiB
+    // (cvs.com, 2026-09) and used to fail the scan outright.
+    let expr = "(function(){ const s = window.__impeccableSnapshot; const c = s.capture({ maxBytes: 200 * 1024 * 1024 }); if (c.error) return { error: c.error }; window.__impCap = c; window.__impIO = s.visualIO(c); return { json: c.json }; })()";
     let out = page.evaluate_value(expr)?;
     if let Some(err) = out.get("error").and_then(Value::as_str) {
         return Err(CdpError::new(format!("snapshot capture failed: {err}")));
     }
-    let json = out
-        .get("json")
+    out.get("json")
         .and_then(Value::as_str)
-        .ok_or_else(|| CdpError::new("snapshot capture returned no json"))?;
+        .map(String::from)
+        .ok_or_else(|| CdpError::new("snapshot capture returned no json"))
+}
+
+/// Parse a capture's JSON into a [`SnapshotDom`].
+pub fn parse_snapshot(json: &str) -> CdpResult<SnapshotDom> {
     SnapshotDom::from_json(json).map_err(|e| CdpError::new(format!("snapshot parse: {e}")))
 }
 
@@ -165,12 +179,26 @@ pub fn resolve_needs<T>(
     page: &mut Page<'_>,
     f: impl Fn(&SnapshotDom) -> T,
 ) -> CdpResult<T> {
+    resolve_needs_recording(dom, page, f, None)
+}
+
+/// [`resolve_needs`], appending every answered hit test to `record` so the
+/// run can be replayed over the same capture without the page.
+pub fn resolve_needs_recording<T>(
+    dom: &SnapshotDom,
+    page: &mut Page<'_>,
+    f: impl Fn(&SnapshotDom) -> T,
+    mut record: Option<&mut Facts>,
+) -> CdpResult<T> {
     let mut out = f(dom);
     let mut rounds = 0;
     while dom.has_needs() && rounds < 12 {
         let needs = dom.take_needs();
         let facts = answer_needs(page, &needs.hit_tests)?;
         dom.add_facts(&facts);
+        if let Some(record) = record.as_deref_mut() {
+            record.hits.extend(facts.hits.iter().cloned());
+        }
         out = f(dom);
         rounds += 1;
     }
@@ -479,43 +507,41 @@ fn sample_background_impl(
         Ok(nodes) => nodes,
     };
     let mut unresolved: Vec<String> = Vec::new();
+    // Translucent surfaces the walk passed through, topmost first. The walk
+    // keeps descending the same stack for the opaque ground under them: a
+    // surface's own parent sits below siblings that paint over it, so
+    // restarting the walk there would skip whatever those paint.
+    let mut pending: Vec<Value> = Vec::new();
     for StackNode { el: node, kind } in nodes {
-        match kind.as_str() {
-            "img" => {
-                let sample = sample_image_element(page, dom, node, px, py)?;
-                if is_sampled(&sample) {
-                    return Ok(sample);
-                }
-                unresolved.push(sample_reason(&sample));
-            }
+        let sample = match kind.as_str() {
+            "img" => sample_image_element(page, dom, node, px, py)?,
             "raster" => {
                 let intrinsic = intrinsic_raster(dom, node);
-                if let Some(source) =
-                    visual::raster_source_point(dom, node, intrinsic.0, intrinsic.1, px, py)
-                {
-                    let node_ref = json!(node);
-                    let pixel =
-                        sample_drawable_pixel(page, &node_ref, intrinsic, source.0, source.1)?;
-                    let sample = visual::raster_finish(dom, node, pixel);
-                    if is_sampled(&sample) {
-                        return Ok(sample);
+                match visual::raster_source_point(dom, node, intrinsic.0, intrinsic.1, px, py) {
+                    Some(source) => {
+                        let node_ref = json!(node);
+                        let pixel =
+                            sample_drawable_pixel(page, &node_ref, intrinsic, source.0, source.1)?;
+                        visual::raster_finish(dom, node, pixel)
                     }
-                    unresolved.push(sample_reason(&sample));
+                    // Outside the drawable: nothing sampled, nothing to say.
+                    None => continue,
                 }
             }
-            _ => {
-                let sample = sample_css_background(page, dom, node, px, py, text_color)?;
-                if is_sampled(&sample) {
-                    if visual::sample_is_opaque(&sample) {
-                        return Ok(sample);
-                    }
-                    let parent = dom.parent(node).or_else(|| dom.body()).unwrap_or(0);
-                    let under =
-                        sample_background_impl(page, dom, parent, px, py, depth + 1.0, text_color)?;
-                    return Ok(visual::alpha_composite(sample, &under));
-                }
-                unresolved.push(sample_reason(&sample));
+            // Paint this walk cannot read (vector artwork).
+            "unreadable" => visual::unreadable_stack_sample(dom, node),
+            _ => sample_css_background(page, dom, node, px, py, text_color)?,
+        };
+        if is_sampled(&sample) {
+            if visual::sample_is_opaque(&sample) {
+                return Ok(visual::composite_stack(&pending, &sample));
             }
+            pending.push(sample);
+            continue;
+        }
+        unresolved.push(sample_reason(&sample));
+        if visual::sample_ends_walk(&sample) {
+            break;
         }
     }
     Ok(visual::unresolved_from_reasons(&unresolved))
