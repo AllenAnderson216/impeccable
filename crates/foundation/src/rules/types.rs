@@ -36,6 +36,14 @@ pub const ANY: &str = "(?s:.)";
 pub struct RuleHit {
     pub id: String,
     pub snippet: String,
+    /// A per-finding severity that overrides the rule's registry severity,
+    /// such as `advisory` on a contrast ratio just under its bar. `None`
+    /// keeps the registry's. The engines carry it onto the finding they
+    /// print, and the finding's `advisory` flag is derived from it. The
+    /// recorded call vectors predate the field and compare `{ id, snippet }`
+    /// only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
 }
 
 impl RuleHit {
@@ -43,7 +51,13 @@ impl RuleHit {
         RuleHit {
             id: id.to_string(),
             snippet,
+            severity: None,
         }
+    }
+
+    /// Whether this hit's own severity is `advisory`.
+    pub fn is_advisory(&self) -> bool {
+        self.severity.as_deref() == Some("advisory")
     }
 }
 
@@ -139,6 +153,75 @@ pub fn is_glyph_only_text(text: &str) -> bool {
     !trimmed.is_empty() && !trimmed.chars().any(char::is_alphanumeric)
 }
 
+/// Families that draw icons rather than letters. Material Icons and Material
+/// Symbols turn a word into a glyph through a ligature (`arrow_forward`
+/// renders as an arrow); the others map private-use code points, which
+/// [`is_glyph_only_text`] already reads as glyphs.
+const ICON_FONT_NAMES: &[&str] = &[
+    "material icons",
+    "material symbols",
+    "materialicons",
+    "materialsymbols",
+    "material design icons",
+    "font awesome",
+    "fontawesome",
+    "icomoon",
+    "glyphicons",
+    "bootstrap-icons",
+    "remixicon",
+    "ionicons",
+    "tabler-icons",
+    "boxicons",
+    "codicon",
+    "octicons",
+    "dashicons",
+    "lineicons",
+    "themify",
+];
+
+/// Whether the first family of a `font-family` list is an icon font: one of
+/// [`ICON_FONT_NAMES`], or a name one of whose words is `icons` or `icon`.
+pub fn is_icon_font_family(font_family: &str) -> bool {
+    let first = font_family.split(',').next().unwrap_or("");
+    let name = js::to_lower_case(js::trim(first).trim_matches(|c| c == '"' || c == '\''));
+    if name.is_empty() {
+        return false;
+    }
+    ICON_FONT_NAMES.iter().any(|n| name.contains(n))
+        || name
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| w == "icons" || w == "icon")
+}
+
+/// Text an icon font turns into a glyph through a ligature: one word of
+/// lowercase letters, digits, `_` or `-` (`arrow_forward`, `close`,
+/// `counter_1`) set in an icon font. A reader sees an icon, not the word.
+pub fn is_icon_ligature_text(text: &str, font_family: &str) -> bool {
+    let word = js::trim(text);
+    !word.is_empty()
+        && word.len() <= 48
+        && word.chars().any(|c| c.is_ascii_lowercase())
+        && word
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        && is_icon_font_family(font_family)
+}
+
+/// A Latin `x` standing in for a close glyph, where [`names_close_control`]
+/// says the control it sits in closes something.
+pub fn is_close_letter_text(text: &str) -> bool {
+    matches!(js::trim(text), "x" | "X")
+}
+
+/// Whether attribute values (a class list, an id, an `aria-label`, a
+/// `title`) name a close or dismiss control.
+pub fn names_close_control(values: &[&str]) -> bool {
+    values.iter().any(|v| {
+        let lower = js::to_lower_case(v);
+        lower.contains("close") || lower.contains("dismiss")
+    })
+}
+
 /// Whether a computed `-webkit-text-fill-color` says the element's glyphs
 /// are not painted in its `color` at all. A gradient heading is written by
 /// clipping a background to the text and filling the text with nothing, so
@@ -167,6 +250,13 @@ pub struct ColorOpts {
     pub font_weight: f64,
     pub has_direct_text: bool,
     pub is_emoji_only: bool,
+    /// The element's own text has no letter and no digit
+    /// ([`is_glyph_only_text`]): a lone circle, a pair of braces, an arrow.
+    /// Nobody reads it, so it is not scored for text contrast on any path,
+    /// SAFE_TAGS or not. The recorded call vectors predate the field and
+    /// leave it false, which scores as they recorded.
+    #[serde(default)]
+    pub is_glyph_only: bool,
     /// The adapter's verdict that this element paints reading text of its
     /// own that no already-scored ancestor carries: direct text that is not
     /// an icon glyph, not visually hidden, and a `color` the nearest
@@ -183,6 +273,35 @@ pub struct ColorOpts {
     /// JS `DETECTOR_IS_BROWSER` (`typeof window !== 'undefined'`): the
     /// static engines pass false, the browser build true.
     pub detector_is_browser: bool,
+    /// The colour the glyphs read in over `effective_bg` (or each gradient
+    /// sample), when the adapter folded the opacity of the boxes between the
+    /// text and its surface into it. `None` scores `text_color`. Either way a
+    /// translucent colour is composited over each background before it is
+    /// scored and printed. The recorded call vectors predate the field.
+    #[serde(default)]
+    pub visible_text: Option<Rgba>,
+    /// What painted the surface when it was not a plain fill, printed after
+    /// the background colour (`gradient on a.primary`). One page reports a
+    /// text colour once per box that paints the gradient, not once per
+    /// sampled colour.
+    #[serde(default)]
+    pub bg_source: Option<String>,
+    /// An opaque identity of the box `bg_source` names, unique within one
+    /// document. The page's one report of a text colour on a gradient is
+    /// claimed per box, because the label is only a tag and a class, which a
+    /// row of same-class tiles on different gradients shares. `None` dedupes
+    /// on the snippet alone.
+    #[serde(default)]
+    pub bg_source_host: Option<String>,
+    /// The adapter's knowledge that its background walk reads only ancestor
+    /// fills, so a resolved surface in exactly the text's own colour is the
+    /// walk landing on a fill the text does not sit on (white copy over a
+    /// photo scored `#ffffff on #ffffff`). With it set the full pass stands
+    /// down there, as the SAFE_TAGS path always has. The recorded call
+    /// vectors predate the field and leave it false, which scores the `1.0:1`
+    /// as they recorded.
+    #[serde(default)]
+    pub same_color_surface_is_unread: bool,
 }
 
 // ─── checkHoverContrast ─────────────────────────────────────────────────────
@@ -225,6 +344,12 @@ pub struct IconTileOpts {
     pub sibling_border_radius: f64,
     pub has_icon_child: bool,
     pub icon_child_width: f64,
+    /// The anchor is a card title set on a non-heading tag (shadcn's
+    /// `CardTitle` is a `div.font-semibold`), which the engines recognize
+    /// from its type. `false` keeps the h1 to h6 anchor alone, the JS
+    /// contract the recorded vectors pin.
+    #[serde(default)]
+    pub heading_is_card_title: bool,
 }
 
 // ─── resolveSerif / checkItalicSerif ────────────────────────────────────────
@@ -264,6 +389,39 @@ pub struct HeroEyebrowOpts {
     pub sibling_font_weight: Option<String>,
     pub sibling_color: Option<String>,
     pub sibling_has_accent_dash_pseudo: bool,
+    /// The tracking, in em of the sibling's size, that counts as tracked caps
+    /// alongside the fixed 1.6px floor ([`HERO_EYEBROW_TRACKING_PX`]). The
+    /// engines pass [`HERO_EYEBROW_TRACKING_EM`]; `None` keeps the fixed floor
+    /// alone, which is the JS contract the recorded vectors pin.
+    #[serde(default)]
+    pub sibling_tracking_floor_em: Option<f64>,
+    /// Whether the sibling is, or holds, a `<time>` element. A dated line
+    /// above a post's h1 is the post's meta, not an eyebrow; the em floor
+    /// alone does not make it tracked caps. `false` is the JS contract.
+    #[serde(default)]
+    pub sibling_holds_time: bool,
+}
+
+/// The fixed tracking floor of the hero eyebrow's tracked-caps signature.
+pub const HERO_EYEBROW_TRACKING_PX: f64 = 1.6;
+
+/// The tracking, in em, at which an uppercase label reads as tracked caps
+/// whatever its size: Tailwind's `tracking-widest` (0.1em) at 12px is 1.2px,
+/// under the fixed floor, and it is the most common eyebrow setting
+/// (redoubt.agency). kicker-above-heading's own floor is 0.06em.
+pub const HERO_EYEBROW_TRACKING_EM: f64 = 0.08;
+
+/// Whether `letter_spacing_px` at `font_size_px` is tracked caps for the hero
+/// eyebrow: at least the fixed floor, or, where the engine passes one, at
+/// least `floor_em` of the size.
+pub fn hero_eyebrow_tracked(letter_spacing_px: f64, font_size_px: f64, floor_em: Option<f64>) -> bool {
+    if letter_spacing_px >= HERO_EYEBROW_TRACKING_PX {
+        return true;
+    }
+    match floor_em {
+        Some(em) if font_size_px > 0.0 => letter_spacing_px > 0.0 && letter_spacing_px >= font_size_px * em - 1e-9,
+        _ => false,
+    }
 }
 
 // ─── checkKickerAboveHeading ────────────────────────────────────────────────
@@ -382,4 +540,10 @@ pub struct GlowOpts {
     /// The element's border-box size in CSS px; `None` without layout.
     #[serde(default)]
     pub element_size: Option<(f64, f64)>,
+    /// The fill behind the element as the background walk resolved it, used
+    /// to measure how far a glow lifts it. `None` where the walk named no
+    /// single fill (an image, a gradient, a surface it could not read), and
+    /// on the engines that pass no surface.
+    #[serde(default)]
+    pub surface: Option<Rgba>,
 }

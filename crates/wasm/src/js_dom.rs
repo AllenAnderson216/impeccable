@@ -35,6 +35,7 @@ extern "C" {
     fn namespace_uri(el: u32) -> String;
     fn parent(el: u32) -> u32;
     fn children(el: u32) -> Vec<u32>;
+    fn shadow_children(el: u32) -> Vec<u32>;
     fn previous_element_sibling(el: u32) -> u32;
     fn next_element_sibling(el: u32) -> u32;
     fn contains(a: u32, b: u32) -> bool;
@@ -62,6 +63,7 @@ extern "C" {
     fn offset_height(el: u32) -> f64;
     fn check_visibility(el: u32) -> i32;
     fn direct_text_rect(el: u32) -> Vec<f64>;
+    fn running_animation_properties(el: u32) -> Option<String>;
     fn text_rects(el: u32) -> Vec<f64>;
 }
 
@@ -211,6 +213,13 @@ impl Dom for JsDom {
                 .clone()
         })
     }
+    /// The open shadow tree's top-level elements, so a web component that
+    /// lays out its content in its shadow tree is not read as empty. The
+    /// flat tree itself is not composed here (`flat_parent` stays the light
+    /// parent and `shadow_trees_recorded` false).
+    fn shadow_children(&self, el: ElId) -> Vec<ElId> {
+        shadow_children(el)
+    }
     fn previous_element_sibling(&self, el: ElId) -> Option<ElId> {
         opt(previous_element_sibling(el))
     }
@@ -359,6 +368,9 @@ impl Dom for JsDom {
     }
     fn offset_height(&self, el: ElId) -> f64 {
         offset_height(el)
+    }
+    fn running_animation_properties(&self, el: ElId) -> Option<Vec<String>> {
+        serde_json::from_str(&running_animation_properties(el)?).ok()
     }
     fn check_visibility(&self, el: ElId) -> Option<bool> {
         match check_visibility(el) {

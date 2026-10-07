@@ -16,8 +16,12 @@
 //! `::placeholder` `color` on text controls, bounding rects, the
 //! client/scroll/offset metrics, `checkVisibility`, direct-text
 //! rects, viewport and scroll, hostname, quirks mode, `body.innerText`, the
-//! `@keyframes` rules, the document HTML for the regex pass, and the media
-//! intrinsics the visual-contrast path needs.
+//! `@keyframes` rules, the document HTML for the regex pass, the media
+//! intrinsics the visual-contrast path needs, and the properties of the
+//! animations and transitions running on each element at capture (`an`,
+//! read only where the snapshot sets `anim`), and the open shadow trees
+//! (their elements after the light DOM, with `sh`, `as` and `ts` linking
+//! them into the flat tree, read only where the snapshot sets `shadow`).
 //!
 //! Two things a snapshot cannot answer up front:
 //!
@@ -60,9 +64,11 @@ pub const NS_MATHML: &str = "http://www.w3.org/1998/Math/MathML";
 pub const STYLE_PROPS: &[&str] = &[
     "animationIterationCount",
     "animationName",
+    "animationTimeline",
     "animationTimingFunction",
     "aspectRatio",
     "backdropFilter",
+    "backfaceVisibility",
     "background",
     "backgroundClip",
     "backgroundColor",
@@ -97,6 +103,7 @@ pub const STYLE_PROPS: &[&str] = &[
     "direction",
     "display",
     "filter",
+    "flexWrap",
     "float",
     "fontFamily",
     "fontSize",
@@ -114,6 +121,7 @@ pub const STYLE_PROPS: &[&str] = &[
     "insetInline",
     "insetInlineEnd",
     "insetInlineStart",
+    "isolation",
     "left",
     "letterSpacing",
     "lineHeight",
@@ -121,6 +129,7 @@ pub const STYLE_PROPS: &[&str] = &[
     "marginLeft",
     "marginRight",
     "marginTop",
+    "maskImage",
     "maxHeight",
     "maxWidth",
     "minHeight",
@@ -166,7 +175,11 @@ pub const STYLE_PROPS: &[&str] = &[
     "webkitBackgroundClip",
     "webkitClipPath",
     "webkitHyphens",
+    "webkitLineClamp",
+    "webkitMaskImage",
     "webkitTextFillColor",
+    "webkitTextStrokeColor",
+    "webkitTextStrokeWidth",
     "whiteSpace",
     "width",
     "willChange",
@@ -194,6 +207,8 @@ pub const PSEUDO_PROPS: &[&str] = &[
     "borderRadius",
     "transform",
     "visibility",
+    "zIndex",
+    "translate",
 ];
 
 /// One child of an element: an element (by id) or a text node's data.
@@ -309,6 +324,25 @@ pub struct SnapNode {
     pub states: Vec<String>,
     #[serde(rename = "md", default)]
     pub media: Option<MediaInfo>,
+    /// The properties of the animations and transitions running on the
+    /// element at capture, written only where there are some. Read only when
+    /// the snapshot says it recorded animations ([`Snapshot::animations_recorded`]).
+    #[serde(rename = "an", default)]
+    pub animations: Option<Vec<String>>,
+    /// The host of the open shadow tree this element is a top-level node
+    /// of. Shadow-tree elements are recorded after every light-DOM element
+    /// and are nobody's child, so document walks and selectors never reach
+    /// them; only the flat-tree walk does.
+    #[serde(rename = "sh", default)]
+    pub shadow_host: Option<u32>,
+    /// `assignedSlot`: the slot of an open shadow tree this element is
+    /// assigned to.
+    #[serde(rename = "as", default)]
+    pub assigned_slot: Option<u32>,
+    /// The slot this element's first non-blank direct text node is assigned
+    /// to (a shadow host whose own text is slotted).
+    #[serde(rename = "ts", default)]
+    pub text_slot: Option<u32>,
 }
 
 fn minus_one() -> i8 {
@@ -347,6 +381,19 @@ impl Needs {
 pub struct Facts {
     #[serde(default)]
     pub hits: Vec<HitTest>,
+    /// Answers to [`SnapshotDom::take_scroll_probes`]: whether a box hidden
+    /// with the page at the top showed once the page was scrolled to it.
+    /// Absent in recordings made before the probe existed, where nothing is
+    /// known and the box counts as hidden.
+    #[serde(rename = "shownOnScroll", default, skip_serializing_if = "Vec::is_empty")]
+    pub shown_on_scroll: Vec<ScrollShown>,
+}
+
+/// One answer of the scroll probe ([`Dom::shown_when_scrolled_to`]).
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ScrollShown {
+    pub el: ElId,
+    pub shown: bool,
 }
 
 /// The serialized page.
@@ -403,11 +450,25 @@ pub struct Snapshot {
     pub text_lines: bool,
     #[serde(default)]
     pub hits: Vec<HitTest>,
+    /// Whether the capture read `document.getAnimations()`, so an element
+    /// without `an` has nothing running. Absent in captures older than that
+    /// read, and on a page without the Web Animations API, where nothing is
+    /// known about running animations.
+    #[serde(rename = "anim", default)]
+    pub animations_recorded: bool,
+    /// Whether the capture walked open shadow trees (`sh`, `as`, `ts`).
+    /// Absent in captures older than that walk, where nothing is known about
+    /// shadow trees.
+    #[serde(rename = "shadow", default)]
+    pub shadow_trees_recorded: bool,
     /// Derived on load: column index per style property name.
     #[serde(skip)]
     style_index: HashMap<String, usize>,
     #[serde(skip)]
     pseudo_index: HashMap<String, usize>,
+    /// Derived on load: the top-level shadow-tree nodes of each host.
+    #[serde(skip)]
+    shadow_kids: HashMap<u32, Vec<u32>>,
 }
 
 impl Snapshot {
@@ -454,6 +515,12 @@ impl Snapshot {
                 }
             }
             self.els[i].children = kids;
+        }
+        self.shadow_kids.clear();
+        for i in 0..self.els.len() {
+            if let Some(host) = self.els[i].shadow_host {
+                self.shadow_kids.entry(host).or_default().push(i as u32 + 1);
+            }
         }
     }
 
@@ -560,6 +627,8 @@ pub struct SnapshotDom {
     closest_cache: RefCell<HashMap<(ElId, String), Result<Option<ElId>, SelectorError>>>,
     text_cache: RefCell<HashMap<ElId, String>>,
     unknown_props: RefCell<Vec<String>>,
+    shown_on_scroll: RefCell<HashMap<ElId, bool>>,
+    scroll_probes: RefCell<Vec<ElId>>,
 }
 
 impl SnapshotDom {
@@ -573,6 +642,8 @@ impl SnapshotDom {
             closest_cache: RefCell::new(HashMap::new()),
             text_cache: RefCell::new(HashMap::new()),
             unknown_props: RefCell::new(Vec::new()),
+            shown_on_scroll: RefCell::new(HashMap::new()),
+            scroll_probes: RefCell::new(Vec::new()),
         };
         let inline: Vec<HitTest> = dom.snap.hits.clone();
         dom.add_hits(&inline);
@@ -598,6 +669,13 @@ impl SnapshotDom {
     /// Supply facts for an earlier [`Self::take_needs`].
     pub fn add_facts(&self, facts: &Facts) {
         self.add_hits(&facts.hits);
+        {
+            let mut shown = self.shown_on_scroll.borrow_mut();
+            for s in &facts.shown_on_scroll {
+                shown.insert(s.el, s.shown);
+            }
+        }
+        self.scroll_probes.borrow_mut().clear();
         // Answers may change what a later run asks; forget the misses.
         self.misses.borrow_mut().clear();
         self.missed_keys.borrow_mut().clear();
@@ -608,6 +686,14 @@ impl SnapshotDom {
         let hit_tests = std::mem::take(&mut *self.misses.borrow_mut());
         self.missed_keys.borrow_mut().clear();
         Needs { hit_tests }
+    }
+
+    /// The boxes [`Dom::shown_when_scrolled_to`] asked about that the facts
+    /// do not answer (drained), in first-asked order. Kept apart from
+    /// [`Self::take_needs`]: only the URL engine's hidden-text step answers
+    /// them, and a consumer that answers hit tests alone never sees them.
+    pub fn take_scroll_probes(&self) -> Vec<ElId> {
+        std::mem::take(&mut *self.scroll_probes.borrow_mut())
     }
 
     /// Whether anything is pending.
@@ -706,6 +792,54 @@ impl Dom for SnapshotDom {
     }
     fn css_escape(&self, s: &str) -> String {
         css_escape(s)
+    }
+    fn shown_when_scrolled_to(&self, el: ElId) -> Option<bool> {
+        if !self.valid(el) {
+            return None;
+        }
+        if let Some(shown) = self.shown_on_scroll.borrow().get(&el) {
+            return Some(*shown);
+        }
+        let mut pending = self.scroll_probes.borrow_mut();
+        if !pending.contains(&el) {
+            pending.push(el);
+        }
+        None
+    }
+    fn running_animation_properties(&self, el: ElId) -> Option<Vec<String>> {
+        if !self.snap.animations_recorded || !self.valid(el) {
+            return None;
+        }
+        Some(self.snap.node(el).animations.clone().unwrap_or_default())
+    }
+    fn flat_parent(&self, el: ElId) -> Option<ElId> {
+        if !self.valid(el) {
+            return None;
+        }
+        let node = self.snap.node(el);
+        node.assigned_slot
+            .filter(|s| self.valid(*s))
+            .or(node.parent)
+            .or(node.shadow_host.filter(|h| self.valid(*h)))
+    }
+    fn text_slot(&self, el: ElId) -> Option<ElId> {
+        if !self.valid(el) {
+            return None;
+        }
+        self.snap.node(el).text_slot.filter(|s| self.valid(*s))
+    }
+    fn shadow_children(&self, el: ElId) -> Vec<ElId> {
+        if !self.valid(el) {
+            return Vec::new();
+        }
+        self.snap
+            .shadow_kids
+            .get(&el)
+            .map(|kids| kids.iter().copied().filter(|k| self.valid(*k)).collect())
+            .unwrap_or_default()
+    }
+    fn shadow_trees_recorded(&self) -> bool {
+        self.snap.shadow_trees_recorded
     }
     fn keyframes(&self, name: &str) -> Option<Vec<KeyframeFrame>> {
         if name.is_empty() {
@@ -1032,6 +1166,37 @@ mod tests {
         SnapshotDom::from_json(json).expect("snapshot json")
     }
 
+    #[test]
+    fn shadow_trees_link_into_the_flat_tree_without_joining_the_document() {
+        let json = r#"{
+          "v": 1, "innerWidth": 1280, "innerHeight": 800, "shadow": true,
+          "styleProps": ["display"], "strings": ["block", "contents"],
+          "documentElement": 1, "body": 2,
+          "els": [
+            {"t":"HTML","c":[2],"s":[0]},
+            {"t":"BODY","p":1,"c":[3],"s":[0]},
+            {"t":"TCG-BUTTON","p":2,"c":[4,"Read more"],"s":[0],"ts":6},
+            {"t":"H3","p":3,"c":["Investors"],"s":[0],"as":6},
+            {"t":"DIV","c":[6],"s":[0],"sh":3},
+            {"t":"SLOT","p":5,"c":[],"s":[1]}
+          ]
+        }"#;
+        let d = snap(json);
+        assert!(d.shadow_trees_recorded());
+        assert_eq!(d.parent(4), Some(3));
+        assert_eq!(d.flat_parent(4), Some(6));
+        assert_eq!(d.flat_parent(6), Some(5));
+        assert_eq!(d.flat_parent(5), Some(3));
+        assert_eq!(d.parent(5), None);
+        assert_eq!(d.text_slot(3), Some(6));
+        assert_eq!(d.text_slot(4), None);
+        assert!(!d.query_all(None, "*").unwrap().contains(&5));
+        assert!(crate::browser::dom::flat_contains(&d, 3, 6));
+        assert!(!d.contains(3, 6));
+        assert!(!snap(SMALL).shadow_trees_recorded());
+        assert_eq!(snap(SMALL).flat_parent(5), Some(4));
+    }
+
     const SMALL: &str = r#"{
       "v": 1, "hostname": "example.test", "innerWidth": 1280, "innerHeight": 800,
       "styleProps": ["display", "color"], "pseudoProps": ["content", "width"],
@@ -1143,6 +1308,33 @@ mod tests {
         assert!(d.unknown_style_props().is_empty());
     }
 
+    /// Running animations are known only where the capture says it read
+    /// them: then an element without `an` has none running, and without the
+    /// flag nothing is known.
+    #[test]
+    fn running_animations_are_known_only_where_recorded() {
+        let els = serde_json::json!([
+            {"t": "HTML", "c": [2]},
+            {"t": "BODY", "p": 1, "c": [3]},
+            {"t": "SPAN", "p": 2, "c": ["solutions"], "an": ["opacity", "filter"]},
+        ]);
+        let recorded = serde_json::json!({
+            "v": 1, "documentElement": 1, "body": 2, "anim": true, "els": els,
+        })
+        .to_string();
+        let d = snap(&recorded);
+        assert_eq!(
+            d.running_animation_properties(3),
+            Some(vec!["opacity".to_string(), "filter".to_string()])
+        );
+        assert_eq!(d.running_animation_properties(2), Some(Vec::new()));
+        assert_eq!(d.running_animation_properties(0), None);
+        let older = serde_json::json!({ "v": 1, "documentElement": 1, "body": 2, "els": els }).to_string();
+        let d = snap(&older);
+        assert_eq!(d.running_animation_properties(3), None);
+        assert_eq!(d.running_animation_properties(2), None);
+    }
+
     /// A capture recorded before the three properties were added still parses
     /// and reads them as unknown rather than panicking or shifting columns.
     #[test]
@@ -1238,10 +1430,31 @@ mod tests {
                 top: 5,
                 stack: vec![5, 4, 3, 1],
             }],
+            ..Facts::default()
         });
         assert_eq!(d.element_from_point(20.0, 20.0), Some(5));
         assert_eq!(d.elements_from_point(20.0, 20.0), vec![5, 4, 3, 1]);
         assert!(!d.has_needs());
+    }
+
+    /// The scroll probe is asked on demand, kept apart from the hit tests a
+    /// consumer answers, and read from the facts once answered; the facts
+    /// leave the field out when there is nothing in it.
+    #[test]
+    fn scroll_probes_are_demand_driven_and_kept_apart() {
+        let d = snap(SMALL);
+        assert_eq!(d.shown_when_scrolled_to(5), None);
+        assert_eq!(d.shown_when_scrolled_to(5), None);
+        assert!(!d.has_needs());
+        assert_eq!(d.take_scroll_probes(), vec![5]);
+        assert!(d.take_scroll_probes().is_empty());
+        let facts: Facts = serde_json::from_str(r#"{"hits":[],"shownOnScroll":[{"el":5,"shown":true}]}"#).unwrap();
+        d.add_facts(&facts);
+        assert_eq!(d.shown_when_scrolled_to(5), Some(true));
+        assert!(d.take_scroll_probes().is_empty());
+        assert_eq!(serde_json::to_string(&Facts::default()).unwrap(), r#"{"hits":[]}"#);
+        let old: Facts = serde_json::from_str(r#"{"hits":[]}"#).unwrap();
+        assert!(old.shown_on_scroll.is_empty());
     }
 
     /// A capture that recorded the text rects hands over the lines; one that

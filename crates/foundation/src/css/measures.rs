@@ -11,7 +11,7 @@
 //! `HashMap` all fit.
 
 use crate::color::{self, Rgba};
-use crate::js::{self, ci, math_max, math_max3, parse_float, WS, WS_CHARS};
+use crate::js::{self, ci, math_max, math_max3, math_min, parse_float, WS, WS_CHARS};
 use crate::js_ext_b::num_truthy;
 use crate::rules::types::{Corners, D};
 use once_cell::sync::Lazy;
@@ -142,9 +142,31 @@ pub fn parse_radius_corners(value: Option<&str>, width_px: f64) -> Option<Corner
 /// [`parse_radius_corners`] with `em` read against `em_px`, the element's
 /// font size.
 pub fn parse_radius_corners_em(value: Option<&str>, width_px: f64, em_px: f64) -> Option<Corners> {
+    let mut halves = value?.split('/');
+    let mut corners = radius_half_corners(halves.next().unwrap_or(""), width_px, em_px)?;
+    // An elliptical corner with a zero vertical radius is square
+    // (`10px / 0`): a corner rounds only when both of its radii do.
+    if let Some(vertical) = halves.next() {
+        let v = radius_half_corners(vertical, width_px, em_px)?;
+        for (h, v) in [
+            (&mut corners.top_left, v.top_left),
+            (&mut corners.top_right, v.top_right),
+            (&mut corners.bottom_right, v.bottom_right),
+            (&mut corners.bottom_left, v.bottom_left),
+        ] {
+            if v <= 0.0 {
+                *h = 0.0;
+            }
+        }
+    }
+    Some(corners)
+}
+
+/// One half of a `border-radius` shorthand (the radii before or after the
+/// `/`), filled out to four corners the way the shorthand does.
+fn radius_half_corners(half: &str, width_px: f64, em_px: f64) -> Option<Corners> {
     re!(WS_SPLIT, format!("{}+", WS));
-    let horizontal = value?.split('/').next().unwrap_or("");
-    let trimmed = js::trim(horizontal);
+    let trimmed = js::trim(half);
     if trimmed.is_empty() {
         return None;
     }
@@ -194,8 +216,13 @@ pub fn parse_radius_corner_px(value: Option<&str>, width_px: f64) -> Option<f64>
 pub fn parse_radius_corner_px_em(value: Option<&str>, width_px: f64, em_px: f64) -> Option<f64> {
     re!(WS_SPLIT_ONE, format!("{}+", WS));
     let trimmed = js::trim(value?);
-    let first = WS_SPLIT_ONE.split(trimmed).find(|t| !t.is_empty())?;
-    radius_token_px(first, width_px, em_px)
+    let mut tokens = WS_SPLIT_ONE.split(trimmed).filter(|t| !t.is_empty());
+    let horizontal = radius_token_px(tokens.next()?, width_px, em_px)?;
+    // `10px 0`: a zero vertical radius leaves the corner square.
+    match tokens.next() {
+        Some(vertical) if radius_token_px(vertical, width_px, em_px)? <= 0.0 => Some(0.0),
+        _ => Some(horizontal),
+    }
 }
 
 /// The custom-property lookup `resolveVarRefs` reads (`customPropMap.get`).
@@ -691,7 +718,11 @@ fn split_shadow_layers(s: &str) -> Vec<&str> {
 /// Whether a computed `box-shadow` draws anything: some layer with a visible
 /// color and a non-zero offset, blur or spread. Tailwind's ring and shadow
 /// variables compute to `rgba(0, 0, 0, 0) 0px 0px 0px 0px` layers, and a
-/// fully zero layer paints nothing even in an opaque color.
+/// fully zero layer paints nothing even in an opaque color. Nor does an
+/// unblurred layer whose negative spread pulls its shape in at least as far
+/// as its offset moves it, measured as a distance so a rounded corner moved
+/// diagonally still counts: outside, that shape stays under the box; inset,
+/// the hole it cuts covers the whole box (`0 0 0 -1px`).
 pub fn box_shadow_paints(box_shadow: &str) -> bool {
     re!(WORD_RE, r"(?-u:\b)[a-zA-Z]+(?-u:\b)");
     re!(NUM_RE, format!(r"-?{d}*\.?{d}+", d = D));
@@ -705,9 +736,14 @@ pub fn box_shadow_paints(box_shadow: &str) -> bool {
         }
         let cleaned = CSS_COLOR_TOKEN_RE.replace_all(layer, " ");
         let cleaned = WORD_RE.replace_all(&cleaned, " ");
-        NUM_RE
-            .find_iter(&cleaned)
-            .any(|m| parse_float(m.as_str()) != 0.0)
+        let nums: Vec<f64> = NUM_RE.find_iter(&cleaned).map(|m| parse_float(m.as_str())).collect();
+        if !nums.iter().any(|&n| n != 0.0) {
+            return false;
+        }
+        match nums.as_slice() {
+            [x, y, blur, spread, ..] if *blur == 0.0 && x.hypot(*y) + spread <= 0.0 => false,
+            _ => true,
+        }
     })
 }
 
@@ -763,6 +799,96 @@ fn shadow_max_blur_px_among(
         }
     }
     max_blur
+}
+
+/// One layer of a computed `box-shadow`: its offsets, blur, spread, whether
+/// it is drawn inside the box, and its colour (`None` when the layer names
+/// none, which is `currentcolor`, or names one that does not parse).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShadowLayer {
+    pub x: f64,
+    pub y: f64,
+    pub blur: f64,
+    pub spread: f64,
+    pub inset: bool,
+    pub alpha: f64,
+    pub color: Option<color::Rgba>,
+}
+
+impl ShadowLayer {
+    /// How far the layer paints past the box on `[top, right, bottom, left]`.
+    /// A Gaussian blur shows about half its radius past the shape it blurs,
+    /// and the shape is the box grown by the spread and moved by the offsets:
+    /// `0 2px 4px -2px` draws a 2px lip under the box and nothing at its
+    /// sides, where `0 2px 4px 0` draws 2px at the sides too.
+    pub fn outer_reach(&self) -> [f64; 4] {
+        let base = self.spread + self.blur / 2.0;
+        [base - self.y, base + self.x, base + self.y, base - self.x]
+    }
+
+    /// The blur that shows as a halo: the radius less whatever a negative
+    /// spread pulls the shape in by. `0 18px 40px -26px` is a tight lift under
+    /// the box, not a 40px halo.
+    pub fn halo_blur(&self) -> f64 {
+        self.blur + math_min(self.spread, 0.0)
+    }
+}
+
+/// Every layer of a computed `box-shadow` that parses to at least two
+/// lengths, in order. `none` and the empty string have none.
+pub fn parse_shadow_layers(box_shadow: &str) -> Vec<ShadowLayer> {
+    re!(WORD_RE, r"(?-u:\b)[a-zA-Z]+(?-u:\b)");
+    re!(NUM_RE, format!(r"-?{d}*\.?{d}+", d = D));
+    re!(INSET_RE, r"(?i)(?-u:\b)inset(?-u:\b)");
+    if box_shadow.is_empty() || box_shadow == "none" {
+        return Vec::new();
+    }
+    let mut layers = Vec::new();
+    for layer in split_shadow_layers(box_shadow) {
+        let color = CSS_COLOR_TOKEN_RE
+            .find(layer)
+            .and_then(|m| color::parse_any_color(Some(m.as_str())));
+        let alpha = shadow_layer_alpha(layer);
+        let cleaned = CSS_COLOR_TOKEN_RE.replace_all(layer, " ");
+        let inset = INSET_RE.is_match(&cleaned);
+        let cleaned = WORD_RE.replace_all(&cleaned, " ");
+        let nums: Vec<f64> = NUM_RE
+            .find_iter(&cleaned)
+            .map(|m| parse_float(m.as_str()))
+            .collect();
+        if nums.len() < 2 || nums.iter().any(|n| !n.is_finite()) {
+            continue;
+        }
+        layers.push(ShadowLayer {
+            x: nums[0],
+            y: nums[1],
+            blur: nums.get(2).copied().unwrap_or(0.0),
+            spread: nums.get(3).copied().unwrap_or(0.0),
+            inset,
+            alpha,
+            color,
+        });
+    }
+    layers
+}
+
+/// The alpha under which a shadow or a border paints nothing a reader sees.
+pub const FAINT_PAINT_ALPHA: f64 = 0.05;
+
+/// How far, per channel, a painted colour has to move the surface it lands on
+/// before a reader sees an edge: a black shadow on a near-black page, or a
+/// hairline in the card's own colour, draws nothing.
+pub const VISIBLE_EDGE_CHANNEL_DELTA: f64 = 8.0;
+
+/// Whether `paint` (with its own alpha) composited over the opaque `surface`
+/// shows against it.
+pub fn paint_shows_over(paint: &color::Rgba, surface: &color::Rgba) -> bool {
+    let over = color::composite_color_over(paint, surface);
+    math_max3(
+        (over.r - surface.r).abs(),
+        (over.g - surface.g).abs(),
+        (over.b - surface.b).abs(),
+    ) >= VISIBLE_EDGE_CHANNEL_DELTA
 }
 
 /// JS: checks.mjs#cssColorAlpha.
@@ -1208,6 +1334,16 @@ mod tests {
             "rgba(0, 0, 0, 0) 0px 0px 0px 0px, rgba(0, 0, 0, 0.1) 0px 0px 0px 1px"
         ));
         assert!(box_shadow_paints("0 2px 4px"));
+        // review of #941: a negative spread with no blur keeps the shape
+        // under the box, or cuts a hole over all of it when inset.
+        assert!(!box_shadow_paints("rgb(0, 0, 0) 0px 0px 0px -1px"));
+        assert!(!box_shadow_paints("rgb(0, 0, 0) 0px 0px 0px -4px inset"));
+        assert!(!box_shadow_paints("rgb(0, 0, 0) 2px -2px 0px -3px"));
+        // A 4px diagonal move under a 4px pull still shows past a rounded
+        // corner (review of #968): the offset is read as a distance.
+        assert!(box_shadow_paints("rgb(0, 0, 0) 4px 4px 0px -4px"));
+        assert!(box_shadow_paints("rgb(0, 0, 0) 0px 4px 0px -3px"), "offset past the spread");
+        assert!(box_shadow_paints("rgb(0, 0, 0) 0px 0px 6px -2px"), "a blur reaches out");
     }
 
     #[test]
@@ -1251,6 +1387,20 @@ mod tests {
         );
         // The vertical half after `/` is not what a stripe runs along.
         assert_eq!(c("12px / 4px").top_left, 12.0);
+        // review of #941: but a zero vertical radius leaves the corner
+        // square, whatever its horizontal one.
+        assert_eq!(
+            c("10px / 0"),
+            Corners { top_left: 0.0, top_right: 0.0, bottom_right: 0.0, bottom_left: 0.0 }
+        );
+        assert_eq!(
+            c("10px / 0px 6px"),
+            Corners { top_left: 0.0, top_right: 10.0, bottom_right: 0.0, bottom_left: 10.0 }
+        );
+        assert_eq!(parse_radius_corners(Some("10px / calc(1px)"), 200.0), None);
+        assert_eq!(parse_radius_corner_px(Some("10px 0px"), 200.0), Some(0.0));
+        assert_eq!(parse_radius_corner_px(Some("10px 4px"), 200.0), Some(10.0));
+        assert_eq!(parse_radius_corner_px(Some("10px"), 200.0), Some(10.0));
         // rem and em read against the 16px root default; % against the box.
         assert_eq!(c("0.375rem").top_left, 6.0);
         assert_eq!(c("0.5em").bottom_right, 8.0);

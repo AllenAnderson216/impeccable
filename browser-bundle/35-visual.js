@@ -69,13 +69,14 @@ function createVisualContrast(IO) {
     return core('vc_pixel_sample', d[0], d[1], d[2], d[3]);
   }
 
-  async function sampleCssBackground(node, point, textColor) {
+  async function sampleCssBackground(node, el, point, textColor) {
     const plan = await core('vc_css_plan', IO.handle(node), __j(textColor));
     if (plan.kind === 'sample') return plan.sample;
     // A url() layer: load, map the point onto the painted image, read a pixel.
+    // An image that covers neither its box nor the text is not the surface.
     const img = await IO.loadImage(plan.url);
-    if (!img) return core('vc_css_url_no_image');
-    const src = await core('vc_css_url_source_point', IO.handle(node), img.w, img.h, plan.size, plan.position, point.x, point.y);
+    if (!img) return core('vc_css_url_no_image', IO.handle(node), IO.handle(el), plan.size, plan.position);
+    const src = await core('vc_css_url_source_point', IO.handle(node), IO.handle(el), img.w, img.h, plan.size, plan.position, point.x, point.y);
     if (!src.point) return src.sample;
     return core('vc_css_url_finish', __j(await sampleDrawablePixel(img.ref, [img.w, img.h], src.point)));
   }
@@ -116,18 +117,19 @@ function createVisualContrast(IO) {
     for (const { node, kind } of nodes) {
       let sample;
       if (kind === 'img') {
-        sample = await sampleImageElement(node, point);
+        sample = await core('vc_media_sample', IO.handle(node), IO.handle(el), __j(await sampleImageElement(node, point)));
       } else if (kind === 'raster') {
         const intrinsic = IO.intrinsicRaster(node);
         const sourcePoint = await core('vc_raster_source_point', IO.handle(node), intrinsic[0], intrinsic[1], point.x, point.y);
         // Outside the drawable: nothing sampled, nothing to say.
         if (!sourcePoint) continue;
-        sample = await core('vc_raster_finish', IO.handle(node), __j(await sampleDrawablePixel(node, intrinsic, sourcePoint)));
+        const raster = await core('vc_raster_finish', IO.handle(node), __j(await sampleDrawablePixel(node, intrinsic, sourcePoint)));
+        sample = await core('vc_media_sample', IO.handle(node), IO.handle(el), __j(raster));
       } else if (kind === 'unreadable') {
         // Paint this walk cannot read (vector artwork).
         sample = await core('vc_unreadable_stack_sample', IO.handle(node));
       } else {
-        sample = await sampleCssBackground(node, point, textColor);
+        sample = await sampleCssBackground(node, el, point, textColor);
       }
       if (sample.status === 'sampled') {
         if (await IO.core('vc_sample_is_opaque', __j(sample))) {
